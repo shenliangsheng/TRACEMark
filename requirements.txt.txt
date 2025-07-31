@@ -1,4 +1,4 @@
-streamlit
-pdfplumber
-python-docx
-openpyxl
+streamlit==1.32.0
+pdfplumber==0.10.0
+python-docx==1.1.0
+openpyxl==3.1.2
