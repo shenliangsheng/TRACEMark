@@ -207,7 +207,6 @@ def extract_pdf_data_streamlit(uploaded_file):
         "事宜类型": "商标注册申请"
     }
 
-
 def process_uploaded_files(uploaded_files, template_word_path, template_excel_path, output_dir, default_agent_fee):
     """
     处理上传的文件列表。
@@ -448,3 +447,4 @@ st.markdown("""
 4.  点击“🚀 开始处理”。
 5.  处理完成后，点击“📥 下载所有生成的文件 (ZIP)”获取结果。
 """)
+
