@@ -67,7 +67,6 @@ def create_word_doc(data, agent_fee, categories, template_path, output_path):
             
     # 处理表格
     table = doc.tables[0]
-    # 移除模板中的示例行（如果存在）
     if len(table.rows) > 2:
         row_to_delete = table.rows[1]
         tbl = row_to_delete._element
@@ -86,10 +85,9 @@ def create_word_doc(data, agent_fee, categories, template_path, output_path):
 
     # 添加合计行
     total_row = table.add_row().cells
-    total_row[0].merge(total_row[3])  # 合并前四个单元格 (序号, 事宜, 商标名称, 类别)
+    total_row[0].merge(total_row[3])  # 合并前四个单元格 (序号、事宜、商标名称、类别)
     total_row[0].text = "合计"
-    # 设置合计单元格内容居中
-    total_row[0].paragraphs[0].alignment = 1  # 1 代表居中对齐
+    total_row[0].paragraphs[0].alignment = 1  # 居中对齐
     total_row[4].text = f"¥{total_official}"  # 总官费
     total_row[5].text = f"¥{total_agent}"  # 总代理费
     total_row[6].text = f"¥{total_subtotal}"  # 总计
@@ -102,8 +100,6 @@ def create_word_doc(data, agent_fee, categories, template_path, output_path):
         return full_output_path
     except Exception as e:
         raise Exception(f"保存Word文件 '{full_output_path}' 失败: {e}")
-
-# --- 核心处理函数 ---
 
 def extract_pdf_data_streamlit(uploaded_file):
     """从Streamlit UploadedFile对象提取数据，模拟顺序阅读。"""
@@ -447,4 +443,3 @@ st.markdown("""
 4.  点击“🚀 开始处理”。
 5.  处理完成后，点击“📥 下载所有生成的文件 (ZIP)”获取结果。
 """)
-
