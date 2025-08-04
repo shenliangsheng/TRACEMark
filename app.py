@@ -150,7 +150,17 @@ for idx, pdf_file in enumerate(files):
         })
         st.success("已生成 ✅")
 
-if all_applicants and st.button("📦 打包下载全部文件"):
+# 在你原来按钮的位置
+if st.button("生成该客户Word", key=f"gen_{idx}"):
+    fname = create_word_doc(data, agent_fee, categories)  # 先生成
+    # 立即提供下载
+    with open(fname, "rb") as f:
+        st.download_button(
+            label="📥 下载请款单",
+            data=f.read(),
+            file_name=os.path.basename(fname),
+            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+        )
     wb = load_workbook(os.path.join(os.path.dirname(__file__), "发票申请表.xlsx"))
     ws = wb.active
     row = 2
@@ -178,4 +188,5 @@ if all_applicants and st.button("📦 打包下载全部文件"):
             zf.write(os.path.join("output", f), f)
     zip_buffer.seek(0)
     st.download_button("⬇️ 下载全部文件", data=zip_buffer, file_name="商标请款单+发票申请.zip", mime="application/zip")
+
 
