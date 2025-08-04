@@ -73,7 +73,7 @@ def number_to_upper(amount):
 
 def create_word_doc(data, agent_fee, categories):
     BASE = os.path.dirname(__file__)
-    doc = Document(os.path.join(BASE, "templates", "请款单.docx"))
+    doc = Document(os.path.join(BASE, "请款单.docx"))
     num_items = len(categories)
     total_official = num_items * 270
     total_agent = num_items * agent_fee
@@ -151,7 +151,7 @@ for idx, pdf_file in enumerate(files):
         st.success("已生成 ✅")
 
 if all_applicants and st.button("📦 打包下载全部文件"):
-    wb = load_workbook(os.path.join(os.path.dirname(__file__), "templates", "发票申请表.xlsx"))
+    wb = load_workbook(os.path.join(os.path.dirname(__file__), "发票申请表.xlsx"))
     ws = wb.active
     row = 2
     for a in all_applicants:
@@ -178,3 +178,4 @@ if all_applicants and st.button("📦 打包下载全部文件"):
             zf.write(os.path.join("output", f), f)
     zip_buffer.seek(0)
     st.download_button("⬇️ 下载全部文件", data=zip_buffer, file_name="商标请款单+发票申请.zip", mime="application/zip")
+
