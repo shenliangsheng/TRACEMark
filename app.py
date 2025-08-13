@@ -1,53 +1,63 @@
 import os
 import re
+import datetime
 import pdfplumber
 import streamlit as st
 from docx import Document
 from openpyxl import load_workbook
 from collections import defaultdict
 import tempfile
-import io
 import traceback
 import shutil
+from pathlib import Path
+import sqlite3
+import pandas as pd
 
 # 设置页面标题和布局
-st.set_page_config(page_title="商标请款单生成系统", layout="wide")
-st.title("商标请款单生成系统")
+st.set_page_config(page_title="商标案件请款系统", layout="wide")
+st.title("商标案件请款系统")
+st.caption("案件类目前仅支持驳回复审、异议申请、无效申请和撤三申请")
 
 # 初始化session状态
 if 'processing_stage' not in st.session_state:
     st.session_state.processing_stage = 0  # 0: 未开始, 1: 提取完成, 2: 生成完成
+if 'case_type' not in st.session_state:
+    st.session_state.case_type = "新申请商标"  # 默认选择
 if 'extracted_data' not in st.session_state:
     st.session_state.extracted_data = None
-if 'manual_input_needed' not in st.session_state:
-    st.session_state.manual_input_needed = {}
 if 'agent_fees' not in st.session_state:
     st.session_state.agent_fees = {}
 if 'generated_files' not in st.session_state:
     st.session_state.generated_files = []
 if 'temp_dir' not in st.session_state:
     st.session_state.temp_dir = ""
+if 'db_path' not in st.session_state:
+    st.session_state.db_path = ""
 
-# 常量定义
-PAYMENT_TEMPLATE = "请款单.docx"
-INVOICE_TEMPLATE = "发票申请表.xlsx"
+# 官费标准
+OFFICIAL_FEES = {
+    "驳回复审": 675,
+    "商标异议": 450,
+    "撤三申请": 450,
+    "无效宣告": 750,
+    "新申请商标": 270,  # 新申请商标的官费
+}
 
-# 检查模板文件是否存在
-def check_templates():
-    """检查模板文件是否存在"""
-    if not os.path.exists(PAYMENT_TEMPLATE):
-        st.error(f"错误: 找不到请款单模板文件 '{PAYMENT_TEMPLATE}'。请确保该文件与应用程序在同一目录下。")
-        return False
-    
-    if not os.path.exists(INVOICE_TEMPLATE):
-        st.error(f"错误: 找不到发票申请表模板文件 '{INVOICE_TEMPLATE}'。请确保该文件与应用程序在同一目录下。")
-        return False
-    
-    return True
+# 金额转大写函数
+CN_NUM = ['零', '壹', '贰', '叁', '肆', '伍', '陆', '柒', '捌', '玖']
+CN_UNIT = ['', '拾', '佰', '仟', '万', '拾', '佰', '仟', '亿']
 
-# PDF处理函数
+def number_to_upper(amount):
+    s = str(int(amount))
+    result = []
+    for i, ch in enumerate(s[::-1]):
+        if int(ch) != 0:
+            result.append(f"{CN_NUM[int(ch)]}{CN_UNIT[i]}")
+    return ''.join(reversed(result)) + "元整"
+
+# ============================= 新申请商标处理函数 =============================
 def extract_pdf_data(pdf_path):
-    """从PDF提取数据"""
+    """从新申请PDF提取数据"""
     applicant = "N/A"
     unified_credit_code = "N/A"
     final_date = "N/A"
@@ -66,7 +76,8 @@ def extract_pdf_data(pdf_path):
                 applicant_match = re.search(r"申请人名称\(中文\)：\s*(.*?)\s*\(\s*英文\)", page_text)
                 applicant = applicant_match.group(1).strip() if applicant_match else "N/A"
                 
-                unified_credit_code_match = re.search(r"统一社会信用代码：\s*([0-9A-Z]+)", page_text)
+                # 使用统一的信用代码提取正则表达式
+                unified_credit_code_match = re.search(r'(?:统一社会信用代码|信用代码)[：:]\s*([0-9A-Z]{18})', page_text, re.IGNORECASE)
                 unified_credit_code = unified_credit_code_match.group(1).strip() if unified_credit_code_match else "N/A"
                 
                 # 尝试从第一页提取日期
@@ -126,90 +137,272 @@ def extract_pdf_data(pdf_path):
         "事宜类型": "商标注册申请"
     }
 
-# 金额转大写函数
-def number_to_upper(amount):
-    """金额转大写（支持万、千等单位）"""
-    CN_NUM = ['零', '壹', '贰', '叁', '肆', '伍', '陆', '柒', '捌', '玖']
-    CN_UNIT = ['元', '拾', '佰', '仟', '万', '拾万', '佰万', '仟万', '亿']
-    
-    s = str(int(amount))[::-1]
-    result = []
-    
-    for i in range(len(s)):
-        digit = int(s[i])
-        unit = CN_UNIT[i] if i < len(CN_UNIT) else ''
-        
-        if digit != 0:
-            result.append(f"{CN_NUM[digit]}{unit}")
-        else:
-            if i == 0 and not result:
-                result.append("零")
-    
-    formatted = ''.join(reversed(result))
-    return formatted + "元整"
+# ============================= 案件类商标处理函数 =============================
+def extract_case_info(text, filename):
+    if any(kw in filename for kw in ['驳回', '复审']):
+        return extract_review_case(text, filename)
+    elif any(kw in filename for kw in ['撤三', '撤销连续']):
+        return extract_non_use_case(text, filename)
+    elif '异议' in filename:
+        return extract_opposition_case(text, filename)
+    elif any(kw in filename for kw in ['无效', '宣告']):
+        return extract_invalid_case(text, filename)
+    else:
+        raise ValueError(f"无法识别案件类型: {filename}")
 
-# 生成Word文档函数
-def create_word_doc(data, agent_fee, categories, output_dir):
+def extract_review_case(text, filename):
+    case_type = "驳回复审"
+    applicant = re.search(r'(?:申请人名称\$\$中文\$\$|申请人名称)：\s*([^\n]*?)(?=\s+(?:统一社会信用代码|地址))', 
+                          text, re.DOTALL)
+    applicant = applicant.group(1).strip() if applicant else "N/A"
+    
+    # 提取统一社会信用代码
+    unified_credit_code_match = re.search(r'(?:统一社会信用代码|信用代码)[：:]\s*([0-9A-Z]{18})', text, re.IGNORECASE)
+    unified_credit_code = unified_credit_code_match.group(1).strip() if unified_credit_code_match else "N/A"
+    
+    trademarks = []
+    for m in re.finditer(r'申请商标：\s*(.*?)\s+类别：\s*(\d+).*?申请号/国际注册号：\s*([0-9A-Za-z]+)', 
+                         text, re.DOTALL):
+        trademarks.append({
+            "商标名称": m.group(1).strip(), 
+            "类别": int(m.group(2)), 
+            "注册号": m.group(3)
+        })
+    
+    return {
+        "文件名": filename, 
+        "案件类型": case_type, 
+        "申请人": applicant,
+        "统一社会信用代码": unified_credit_code,
+        "商标列表": trademarks
+    }
+
+def extract_non_use_case(text, filename):
+    case_type = "撤三申请"
+    applicant = re.search(r'(?:申请人名称|申请人)：\s*([^\n]*?)(?=\s+(?:统一社会信用代码|地址))', 
+                          text, re.DOTALL)
+    applicant = applicant.group(1).strip() if applicant else "N/A"
+    
+    # 提取统一社会信用代码
+    unified_credit_code_match = re.search(r'(?:统一社会信用代码|信用代码)[：:]\s*([0-9A-Z]{18})', text, re.IGNORECASE)
+    unified_credit_code = unified_credit_code_match.group(1).strip() if unified_credit_code_match else "N/A"
+    
+    trademarks = []
+    for m in re.finditer(r'商标：\s*(.*?)\s+类别：\s*(\d+).*?商标注册号：\s*([0-9A-Za-z]+)', 
+                         text, re.DOTALL):
+        trademarks.append({
+            "商标名称": m.group(1).strip(), 
+            "类别": int(m.group(2)), 
+            "注册号": m.group(3)
+        })
+    
+    return {
+        "文件名": filename, 
+        "案件类型": case_type, 
+        "申请人": applicant,
+        "统一社会信用代码": unified_credit_code,
+        "商标列表": trademarks
+    }
+
+def extract_opposition_case(text, filename):
+    case_type = "商标异议"
+    applicant = re.search(r'异议人名称：\s*([^\n]*?)\s+统一社会信用代码', 
+                          text, re.IGNORECASE)
+    applicant = applicant.group(1).strip() if applicant else "N/A"
+    
+    # 提取统一社会信用代码
+    unified_credit_code_match = re.search(r'(?:统一社会信用代码|信用代码)[：:]\s*([0-9A-Z]{18})', text, re.IGNORECASE)
+    unified_credit_code = unified_credit_code_match.group(1).strip() if unified_credit_code_match else "N/A"
+    
+    trademarks = []
+    for m in re.finditer(r'被异议商标：\s*(.*?)\s+被异议类别：\s*(\d+).*?商标注册号：\s*([0-9A-Za-z]+)', 
+                         text, re.DOTALL):
+        trademarks.append({
+            "商标名称": m.group(1).strip(), 
+            "类别": int(m.group(2)), 
+            "注册号": m.group(3)
+        })
+    
+    return {
+        "文件名": filename, 
+        "案件类型": case_type, 
+        "申请人": applicant,
+        "统一社会信用代码": unified_credit_code,
+        "商标列表": trademarks
+    }
+
+def extract_invalid_case(text, filename):
+    case_type = "无效宣告"
+    applicant = re.search(r'(?:申请人名称\$\$中文\$\$|申请人名称)：\s*([^\n]*?)(?=\s+(?:统一社会信用代码|地址))', 
+                          text, re.DOTALL)
+    applicant = applicant.group(1).strip() if applicant else "N/A"
+    
+    # 提取统一社会信用代码
+    unified_credit_code_match = re.search(r'(?:统一社会信用代码|信用代码)[：:]\s*([0-9A-Z]{18})', text, re.IGNORECASE)
+    unified_credit_code = unified_credit_code_match.group(1).strip() if unified_credit_code_match else "N/A"
+    
+    trademarks = []
+    for m in re.finditer(r'争议商标：\s*(.*?)\s+类别：\s*(\d+).*?注册号/国际注册号：\s*([0-9A-Za-z]+)', 
+                         text, re.DOTALL):
+        trademarks.append({
+            "商标名称": m.group(1).strip(), 
+            "类别": int(m.group(2)), 
+            "注册号": m.group(3)
+        })
+    
+    return {
+        "文件名": filename, 
+        "案件类型": case_type, 
+        "申请人": applicant,
+        "统一社会信用代码": unified_credit_code,
+        "商标列表": trademarks
+    }
+
+# ============================= 数据库操作函数 =============================
+def init_database(db_path):
+    """初始化数据库"""
+    conn = sqlite3.connect(db_path)
+    c = conn.cursor()
+    
+    # 创建案件记录表
+    c.execute('''CREATE TABLE IF NOT EXISTS trademark_records (
+                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 case_type TEXT,
+                 applicant TEXT,
+                 unified_credit_code TEXT,
+                 trademark_name TEXT,
+                 category TEXT,
+                 case_detail_type TEXT,
+                 official_fee REAL,
+                 agent_fee REAL,
+                 process_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+             )''')
+    
+    # 创建汇总记录表
+    c.execute('''CREATE TABLE IF NOT EXISTS summary_records (
+                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 case_type TEXT,
+                 applicant TEXT,
+                 unified_credit_code TEXT,
+                 total_official_fee REAL,
+                 total_agent_fee REAL,
+                 total_fee REAL,
+                 process_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+             )''')
+    
+    conn.commit()
+    conn.close()
+
+def save_to_database(db_path, record_type, record):
+    """保存记录到数据库"""
+    conn = sqlite3.connect(db_path)
+    c = conn.cursor()
+    
+    if record_type == "trademark":
+        # 插入商标记录
+        c.execute('''INSERT INTO trademark_records 
+                     (case_type, applicant, unified_credit_code, trademark_name, category, case_detail_type, official_fee, agent_fee)
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?)''',
+                  (record['case_type'], record['applicant'], record['unified_credit_code'], 
+                   record['trademark_name'], record['category'], record['case_detail_type'],
+                   record['official_fee'], record['agent_fee']))
+    
+    elif record_type == "summary":
+        # 插入汇总记录
+        c.execute('''INSERT INTO summary_records 
+                     (case_type, applicant, unified_credit_code, total_official_fee, total_agent_fee, total_fee)
+                     VALUES (?, ?, ?, ?, ?, ?)''',
+                  (record['case_type'], record['applicant'], record['unified_credit_code'], 
+                   record['total_official_fee'], record['total_agent_fee'], record['total_fee']))
+    
+    conn.commit()
+    conn.close()
+
+def export_database_to_excel(db_path, output_dir):
+    """导出数据库为Excel文件"""
+    conn = sqlite3.connect(db_path)
+    
+    # 读取商标记录表
+    trademark_df = pd.read_sql_query("SELECT * FROM trademark_records", conn)
+    # 读取汇总记录表
+    summary_df = pd.read_sql_query("SELECT * FROM summary_records", conn)
+    
+    conn.close()
+    
+    # 创建Excel文件
+    excel_path = os.path.join(output_dir, "商标案件数据库.xlsx")
+    with pd.ExcelWriter(excel_path) as writer:
+        trademark_df.to_excel(writer, sheet_name='商标记录', index=False)
+        summary_df.to_excel(writer, sheet_name='汇总记录', index=False)
+    
+    return excel_path
+
+# ============================= 通用文档生成函数 =============================
+def create_word_doc(applicant, records, output_dir, case_type):
     """生成Word请款单"""
     # 使用后台模板文件
-    if not os.path.exists(PAYMENT_TEMPLATE):
-        st.error(f"错误: 找不到请款单模板文件 '{PAYMENT_TEMPLATE}'")
+    template_path = "请款单模板.docx"
+    
+    if not os.path.exists(template_path):
+        st.error(f"错误: 找不到请款单模板文件 '{template_path}'")
         return None
     
     try:
-        doc = Document(PAYMENT_TEMPLATE)
+        doc = Document(template_path)
         
-        num_items = len(categories)
-        total_official = num_items * 270
-        total_agent = num_items * agent_fee
-        total_subtotal = total_official + total_agent
-        total_upper = number_to_upper(total_subtotal)
-
-        # 替换段落占位符
+        # 计算汇总
+        if case_type == "新申请商标":
+            case_types = ["商标注册申请"]
+        else:
+            case_types = list({r["案件类型"] for r in records})
+        
+        case_type_str = "、".join(case_types)
+        total_official = sum(r["官费"] for r in records)
+        total_agent = sum(r["代理费"] for r in records)
+        total = total_official + total_agent
+        
+        # 替换正文占位符
+        today_str = datetime.date.today().strftime("%Y年%m月%d日")
         for para in doc.paragraphs:
-            if "{申请人}" in para.text:
-                para.text = para.text.replace("{申请人}", data["申请人"])
-            if "{事宜类型}" in para.text:
-                para.text = para.text.replace("{事宜类型}", "商标注册申请")
-            if "{日期}" in para.text:
-                para.text = para.text.replace("{日期}", data["日期"])
-            if "合计：" in para.text:
-                para.text = para.text.replace("{总官费}", str(total_official))
-                para.text = para.text.replace("{总代理费}", str(total_agent))
-                para.text = para.text.replace("{总计}", str(total_subtotal))
-                para.text = para.text.replace("{大写}", total_upper)
-
-        # 处理表格
+            for run in para.runs:
+                run.text = run.text.replace("{申请人}", applicant) \
+                                  .replace("{事宜类型}", case_type_str) \
+                                  .replace("{日期}", today_str) \
+                                  .replace("{总官费}", str(total_official)) \
+                                  .replace("{总代理费}", str(total_agent)) \
+                                  .replace("{总计}", str(total)) \
+                                  .replace("{大写}", number_to_upper(total))
+        
+        # 动态写入表格
         if doc.tables:
             table = doc.tables[0]
-            if len(table.rows) > 2:
-                # 删除模板中的示例行
-                row_to_delete = table.rows[1]
-                tbl = row_to_delete._element
-                tbl.getparent().remove(tbl)
-
-            # 添加商标信息行
-            for idx, item in enumerate(categories, 1):
+            
+            # 删除模板中的示例行（如果存在）
+            if len(table.rows) > 1:
+                for _ in range(len(table.rows) - 1, 0, -1):
+                    table._tbl.remove(table.rows[1]._tr)
+            
+            # 添加数据行
+            for idx, rec in enumerate(records, 1):
                 row = table.add_row().cells
-                row[0].text = str(idx)  # 序号
-                row[1].text = "商标注册申请"  # 商标名称
-                row[2].text = item['商标名称']  # 事宜
-                row[3].text = item['类别']  # 类别
-                row[4].text = f"{270}"  # 官费
-                row[5].text = f"{agent_fee}"  # 代理费
-                row[6].text = f"{270 + agent_fee}"  # 小计
-
-            # 添加合计行
+                row[0].text = str(idx)
+                row[1].text = rec["案件类型"] if case_type != "新申请商标" else "商标注册申请"
+                row[2].text = rec["商标名称"]
+                row[3].text = str(rec["类别"])
+                row[4].text = f"{rec['官费']}"
+                row[5].text = f"{rec['代理费']}"
+                row[6].text = f"{rec['官费'] + rec['代理费']}"
+            
+            # 追加合计行
             total_row = table.add_row().cells
-            total_row[0].merge(total_row[3])  # 合并前四个单元格
+            total_row[0].merge(total_row[3])
             total_row[0].text = "合计"
-            total_row[0].paragraphs[0].alignment = 1  # 居中对齐
-            total_row[4].text = f"{total_official}"  # 总官费
-            total_row[5].text = f"{total_agent}"  # 总代理费
-            total_row[6].text = f"{total_subtotal}"  # 总计
-
-        # 生成文件名并保存
-        filename = f"请款单（{data['申请人']}-商标注册申请-{total_subtotal}-{data['日期']}）.docx"
+            total_row[4].text = f"{total_official}"
+            total_row[5].text = f"{total_agent}"
+            total_row[6].text = f"{total}"
+        
+        # 保存文件
+        filename = f"请款单（{applicant}-{case_type_str}）-{total}-{datetime.date.today().strftime('%Y%m%d')}.docx"
         output_path = os.path.join(output_dir, filename)
         doc.save(output_path)
         
@@ -219,53 +412,61 @@ def create_word_doc(data, agent_fee, categories, output_dir):
         st.text(traceback.format_exc())
         return None
 
-# 生成Excel汇总函数
-def create_excel_summary(all_applicants_summary, output_dir):
+def build_excel(rows, output_dir):
     """生成Excel汇总表"""
     # 使用后台模板文件
-    if not os.path.exists(INVOICE_TEMPLATE):
-        st.error(f"错误: 找不到发票申请表模板文件 '{INVOICE_TEMPLATE}'")
+    template_path = "发票申请表.xlsx"
+    
+    if not os.path.exists(template_path):
+        st.error(f"错误: 找不到发票申请表模板文件 '{template_path}'")
         return None
     
     try:
-        wb = load_workbook(INVOICE_TEMPLATE)
+        wb = load_workbook(template_path)
         ws = wb.active
-        row_num = 2
+        row_idx = 2
         
-        for applicant_data in all_applicants_summary:
-            # 官费行
-            ws[f'C{row_num}'] = applicant_data["申请人"]
-            ws[f'D{row_num}'] = applicant_data["统一社会信用代码"]
-            ws[f'G{row_num}'] = applicant_data["总官费"]
-            ws[f'H{row_num}'] = applicant_data["总官费"]
-            ws[f'I{row_num}'] = applicant_data["总计"]
-            ws[f'Q{row_num}'] = applicant_data["日期"]
-            row_num += 1
+        for r in rows:
+            ws[f"B{row_idx}"] = r["申请人"]
+            ws[f"C{row_idx}"] = r["统一社会信用代码"]  # 统一社会信用代码列
+            ws[f"G{row_idx}"] = r["总官费"]
+            ws[f"H{row_idx}"] = r["总官费"]
+            ws[f"I{row_idx}"] = r["总计"]
+            ws[f"Q{row_idx}"] = datetime.date.today().strftime("%Y年%m月%d日")
+            row_idx += 1
             
-            # 代理费行
-            ws[f'C{row_num}'] = applicant_data["申请人"]
-            ws[f'D{row_num}'] = applicant_data["统一社会信用代码"]
-            ws[f'G{row_num}'] = applicant_data["总代理费"]
-            ws[f'H{row_num}'] = applicant_data["总代理费"]
-            ws[f'I{row_num}'] = applicant_data["总计"]
-            ws[f'Q{row_num}'] = applicant_data["日期"]
-            row_num += 1
+            ws[f"B{row_idx}"] = r["申请人"]
+            ws[f"C{row_idx}"] = r["统一社会信用代码"]  # 统一社会信用代码列
+            ws[f"G{row_idx}"] = r["总代理费"]
+            ws[f"H{row_idx}"] = r["总代理费"]
+            ws[f"I{row_idx}"] = r["总计"]
+            ws[f"Q{row_idx}"] = datetime.date.today().strftime("%Y年%m月%d日")
+            row_idx += 1
         
-        summary_date = all_applicants_summary[0]["日期"] if all_applicants_summary else "N/A"
-        excel_filename = f"发票申请表-{summary_date}.xlsx"
-        excel_path = os.path.join(output_dir, excel_filename)
+        excel_name = f"发票申请表-{datetime.date.today().strftime('%Y%m%d')}.xlsx"
+        excel_path = os.path.join(output_dir, excel_name)
         wb.save(excel_path)
         
-        return excel_filename
+        return excel_name
     except Exception as e:
         st.error(f"生成Excel汇总时出错: {str(e)}")
         st.text(traceback.format_exc())
         return None
 
-# 主应用逻辑
+# ============================= 主应用逻辑 =============================
 def main_app():
+    # 案件类型选择
+    st.header("1. 选择案件类型")
+    st.session_state.case_type = st.radio(
+        "请选择处理的案件类型:",
+        ["新申请商标", "案件类商标"],
+        index=0 if st.session_state.case_type == "新申请商标" else 1
+    )
+    
+    case_type = st.session_state.case_type
+    
     # 文件上传和处理区域
-    st.header("1. 上传PDF文件")
+    st.header("2. 上传案件PDF文件")
     uploaded_files = st.file_uploader("请选择PDF文件", type="pdf", accept_multiple_files=True)
 
     if uploaded_files and st.button("处理PDF文件"):
@@ -274,6 +475,11 @@ def main_app():
                 # 创建临时目录
                 temp_dir = tempfile.mkdtemp()
                 st.session_state.temp_dir = temp_dir
+                
+                # 初始化数据库
+                db_path = os.path.join(temp_dir, "trademark_database.db")
+                st.session_state.db_path = db_path
+                init_database(db_path)
                 
                 pdf_dir = os.path.join(temp_dir, "pdf_files")
                 output_dir = os.path.join(temp_dir, "output")
@@ -286,148 +492,250 @@ def main_app():
                     with open(file_path, "wb") as f:
                         f.write(uploaded_file.getbuffer())
                 
-                # 使用原有逻辑处理PDF
-                applicant_data_groups = defaultdict(list)
-                manual_input_needed = {}
+                # 按申请人聚合
+                applicant_map = defaultdict(list)
+                extracted_data = []
                 
                 for filename in os.listdir(pdf_dir):
                     if filename.endswith(".pdf"):
                         try:
-                            pdf_path = os.path.join(pdf_dir, filename)
-                            data = extract_pdf_data(pdf_path)
-                            applicant = data["申请人"]
-                            applicant_data_groups[applicant].append(data)
+                            file_path = os.path.join(pdf_dir, filename)
                             
-                            # 检查需要手动输入的商标
-                            for tm_item in data["商标列表"]:
-                                if tm_item["类别"] == "MANUAL_INPUT_REQUIRED":
-                                    if applicant not in manual_input_needed:
-                                        manual_input_needed[applicant] = []
-                                    manual_input_needed[applicant].append(tm_item["商标名称"])
+                            if case_type == "新申请商标":
+                                # 新申请商标处理
+                                data = extract_pdf_data(file_path)
+                                applicant = data["申请人"]
+                                unified_credit_code = data["统一社会信用代码"]
+                                
+                                for tm in data["商标列表"]:
+                                    # 处理需要手动输入的类别
+                                    if tm["类别"] == "MANUAL_INPUT_REQUIRED":
+                                        # 在后续步骤中处理
+                                        continue
                                     
+                                    applicant_map[applicant].append({
+                                        "商标名称": tm["商标名称"],
+                                        "类别": tm["类别"],
+                                        "案件类型": "商标注册申请",
+                                        "官费": OFFICIAL_FEES["新申请商标"],
+                                        "统一社会信用代码": unified_credit_code,  # 添加统一社会信用代码
+                                    })
+                                
+                                extracted_data.append(data)
+                                st.success(f"成功处理: {filename} (申请人: {applicant})")
+                            
+                            else:
+                                # 案件类商标处理
+                                with pdfplumber.open(file_path) as pdf:
+                                    text = []
+                                    for page in pdf.pages:
+                                        txt = page.extract_text()
+                                        if not txt:
+                                            continue
+                                        if any(k in txt for k in ["申请书", "申 请 书", "撤销", "异议", "无效", "宣告"]):
+                                            txt = txt.replace("　", " ").replace("\xa0", " ")
+                                            txt = re.sub(r'[\u3000]', ' ', txt)
+                                            text.append(txt)
+                                    text = "".join(text).strip()
+                                
+                                # 提取案件信息
+                                data = extract_case_info(text, filename)
+                                applicant = data["申请人"]
+                                unified_credit_code = data["统一社会信用代码"]
+                                
+                                for tm in data["商标列表"]:
+                                    applicant_map[applicant].append({
+                                        "商标名称": tm["商标名称"],
+                                        "类别": tm["类别"],
+                                        "案件类型": data["案件类型"],
+                                        "官费": OFFICIAL_FEES[data["案件类型"]],
+                                        "统一社会信用代码": unified_credit_code,  # 添加统一社会信用代码
+                                    })
+                                
+                                extracted_data.append(data)
+                                st.success(f"成功处理: {filename} (申请人: {applicant}, 类型: {data['案件类型']})")
+                                
                         except Exception as e:
                             st.error(f"处理文件 {filename} 时出错: {str(e)}")
                             st.text(traceback.format_exc())
                 
                 # 保存处理结果到session
-                st.session_state.extracted_data = dict(applicant_data_groups)
-                st.session_state.manual_input_needed = manual_input_needed
+                st.session_state.extracted_data = extracted_data
+                st.session_state.applicant_map = dict(applicant_map)
                 st.session_state.processing_stage = 1
                 
                 st.success(f"成功处理 {len(uploaded_files)} 个PDF文件！")
-                st.info(f"共发现 {len(applicant_data_groups)} 个申请人")
+                st.info(f"共发现 {len(applicant_map)} 个申请人")
+                
             except Exception as e:
                 st.error(f"处理过程中发生错误: {str(e)}")
                 st.text(traceback.format_exc())
 
     # 显示提取结果
     if st.session_state.processing_stage >= 1 and st.session_state.extracted_data:
-        st.header("2. 提取结果")
+        st.header("3. 提取结果")
         
-        for applicant, data_list in st.session_state.extracted_data.items():
+        for applicant, records in st.session_state.applicant_map.items():
             with st.expander(f"申请人: {applicant}"):
-                total_trademarks = 0
-                for data in data_list:
-                    total_trademarks += len(data["商标列表"])
-                    st.write(f"统一社会信用代码: {data.get('统一社会信用代码', 'N/A')}")
-                    st.write(f"日期: {data.get('日期', 'N/A')}")
-                    st.write(f"商标数量: {len(data['商标列表'])}")
+                st.write(f"统一社会信用代码: {records[0].get('统一社会信用代码', 'N/A')}")
+                st.write(f"案件数量: {len(records)}")
+                for record in records:
+                    st.write(f"- 商标: {record['商标名称']}, 类别: {record['类别']}, 类型: {record['案件类型']}, 官费: {record['官费']}元")
                 
-                # 显示需要手动输入的商标
-                if applicant in st.session_state.manual_input_needed:
-                    st.warning("以下商标需要手动输入类别:")
-                    for tm_name in st.session_state.manual_input_needed[applicant]:
-                        st.write(f"- {tm_name}")
+                # 显示新申请商标需要手动输入的类别
+                if case_type == "新申请商标":
+                    for data in st.session_state.extracted_data:
+                        if data["申请人"] == applicant:
+                            for tm in data["商标列表"]:
+                                if tm["类别"] == "MANUAL_INPUT_REQUIRED":
+                                    st.warning(f"商标 '{tm['商标名称']}' 需要手动输入类别")
 
-    # 手动输入区域
-    if st.session_state.processing_stage >= 1 and st.session_state.extracted_data:
-        st.header("3. 设置参数")
+    # 设置代理费和手动输入类别
+    if st.session_state.processing_stage >= 1 and st.session_state.applicant_map:
+        st.header("4. 设置参数")
         
-        # 为每个申请人设置代理费
+        # 设置代理费
         st.subheader("代理费设置")
-        for applicant in st.session_state.extracted_data.keys():
+        for applicant in st.session_state.applicant_map.keys():
             default_fee = st.session_state.agent_fees.get(applicant, 1000)
             fee = st.number_input(
-                f"{applicant}的代理费(元/项)", 
+                f"{applicant}的代理费(元/件)", 
                 min_value=0, 
                 value=default_fee,
                 key=f"fee_{applicant}"
             )
             st.session_state.agent_fees[applicant] = fee
         
-        # 为需要手动输入的商标提供输入框
-        if any(st.session_state.manual_input_needed.values()):
+        # 新申请商标需要手动输入类别
+        if case_type == "新申请商标":
             st.subheader("商标类别设置")
-            for applicant, tm_list in st.session_state.manual_input_needed.items():
-                if tm_list:
-                    st.markdown(f"**{applicant}**")
-                    for tm_name in tm_list:
+            for data in st.session_state.extracted_data:
+                applicant = data["申请人"]
+                for tm in data["商标列表"]:
+                    if tm["类别"] == "MANUAL_INPUT_REQUIRED":
+                        key = f"manual_{applicant}_{tm['商标名称']}"
                         categories = st.text_input(
-                            f"商标 '{tm_name}' 的类别(多个类别用逗号分隔)", 
-                            key=f"manual_{applicant}_{tm_name}",
+                            f"商标 '{tm['商标名称']}' 的类别(多个类别用逗号分隔)", 
+                            key=key,
                             placeholder="例如: 9,35,42"
                         )
-        else:
-            st.info("没有需要手动输入类别的商标")
+                        
+                        # 保存手动输入的类别
+                        if categories:
+                            st.session_state[key] = categories
 
     # 生成文档按钮
-    if st.session_state.processing_stage >= 1 and st.session_state.extracted_data and st.button("生成请款单"):
+    if st.session_state.processing_stage >= 1 and st.session_state.applicant_map and st.button("生成请款单"):
         with st.spinner("正在生成请款单和汇总表..."):
             try:
                 output_dir = os.path.join(st.session_state.temp_dir, "output")
                 os.makedirs(output_dir, exist_ok=True)
                 
                 generated_files = []
-                all_applicants_summary = []
+                excel_rows = []
                 
-                for applicant, data_list in st.session_state.extracted_data.items():
+                for applicant, records in st.session_state.applicant_map.items():
                     try:
-                        # 合并商标数据
-                        merged_trademarks = []
-                        latest_date = "N/A"
-                        unified_credit_code = "N/A"
-                        
-                        for data in data_list:
-                            for tm_item in data["商标列表"]:
-                                # 处理需要手动输入的商标
-                                if tm_item["类别"] == "MANUAL_INPUT_REQUIRED":
-                                    key = (applicant, tm_item["商标名称"])
-                                    categories_input = st.session_state.get(f"manual_{applicant}_{tm_item['商标名称']}", "")
-                                    if categories_input:
-                                        categories = [cat.strip() for cat in categories_input.split(",") if cat.strip()]
-                                        for cat in categories:
-                                            merged_trademarks.append({
-                                                "商标名称": tm_item["商标名称"],
-                                                "类别": cat
-                                            })
-                                else:
-                                    merged_trademarks.append(tm_item)
-                            
-                            # 更新最新日期和统一社会信用代码
-                            if data["日期"] != "N/A":
-                                latest_date = data["日期"]
-                            if data["统一社会信用代码"] != "N/A":
-                                unified_credit_code = data["统一社会信用代码"]
-                        
-                        # 准备数据
-                        merged_data = {
-                            "申请人": applicant,
-                            "统一社会信用代码": unified_credit_code,
-                            "日期": latest_date,
-                            "商标列表": merged_trademarks,
-                            "事宜类型": "商标注册申请"
-                        }
-                        
-                        # 获取代理费
+                        # 添加代理费到记录
                         agent_fee = st.session_state.agent_fees.get(applicant, 1000)
                         
+                        # 对于新申请商标，添加手动输入的类别
+                        if st.session_state.case_type == "新申请商标":
+                            # 创建一个新的记录列表，处理手动输入
+                            processed_records = []
+                            unified_credit_code = records[0].get("统一社会信用代码", "N/A")
+                            
+                            for data in st.session_state.extracted_data:
+                                if data["申请人"] == applicant:
+                                    for tm in data["商标列表"]:
+                                        if tm["类别"] == "MANUAL_INPUT_REQUIRED":
+                                            key = f"manual_{applicant}_{tm['商标名称']}"
+                                            categories_input = st.session_state.get(key, "")
+                                            if categories_input:
+                                                categories = [cat.strip() for cat in categories_input.split(",") if cat.strip()]
+                                                for cat in categories:
+                                                    processed_records.append({
+                                                        "商标名称": tm["商标名称"],
+                                                        "类别": cat,
+                                                        "案件类型": "商标注册申请",
+                                                        "官费": OFFICIAL_FEES["新申请商标"],
+                                                        "代理费": agent_fee,
+                                                        "统一社会信用代码": unified_credit_code,
+                                                    })
+                                                    
+                                                    # 保存到数据库
+                                                    save_to_database(
+                                                        st.session_state.db_path, 
+                                                        "trademark",
+                                                        {
+                                                            "case_type": "新申请商标",
+                                                            "applicant": applicant,
+                                                            "unified_credit_code": unified_credit_code,
+                                                            "trademark_name": tm["商标名称"],
+                                                            "category": cat,
+                                                            "case_detail_type": "商标注册申请",
+                                                            "official_fee": OFFICIAL_FEES["新申请商标"],
+                                                            "agent_fee": agent_fee
+                                                        }
+                                                    )
+                                        else:
+                                            processed_records.append({
+                                                "商标名称": tm["商标名称"],
+                                                "类别": tm["类别"],
+                                                "案件类型": "商标注册申请",
+                                                "官费": OFFICIAL_FEES["新申请商标"],
+                                                "代理费": agent_fee,
+                                                "统一社会信用代码": unified_credit_code,
+                                            })
+                                            
+                                            # 保存到数据库
+                                            save_to_database(
+                                                st.session_state.db_path, 
+                                                "trademark",
+                                                {
+                                                    "case_type": "新申请商标",
+                                                    "applicant": applicant,
+                                                    "unified_credit_code": unified_credit_code,
+                                                    "trademark_name": tm["商标名称"],
+                                                    "category": tm["类别"],
+                                                    "case_detail_type": "商标注册申请",
+                                                    "official_fee": OFFICIAL_FEES["新申请商标"],
+                                                    "agent_fee": agent_fee
+                                                }
+                                            )
+                        else:
+                            # 案件类商标直接添加代理费
+                            processed_records = []
+                            unified_credit_code = records[0].get("统一社会信用代码", "N/A")
+                            
+                            for record in records:
+                                record["代理费"] = agent_fee
+                                record["统一社会信用代码"] = unified_credit_code
+                                processed_records.append(record)
+                                
+                                # 保存到数据库
+                                save_to_database(
+                                    st.session_state.db_path, 
+                                    "trademark",
+                                    {
+                                        "case_type": "案件类商标",
+                                        "applicant": applicant,
+                                        "unified_credit_code": unified_credit_code,
+                                        "trademark_name": record["商标名称"],
+                                        "category": record["类别"],
+                                        "case_detail_type": record["案件类型"],
+                                        "official_fee": record["官费"],
+                                        "agent_fee": agent_fee
+                                    }
+                                )
+                        
                         # 生成Word文档
-                        if merged_trademarks:
+                        if processed_records:
                             word_filename = create_word_doc(
-                                merged_data, 
-                                agent_fee, 
-                                merged_trademarks,
-                                output_dir
+                                applicant, 
+                                processed_records, 
+                                output_dir,
+                                st.session_state.case_type
                             )
                             
                             if word_filename:
@@ -442,18 +750,30 @@ def main_app():
                                 })
                                 
                                 # 收集汇总数据
-                                num_items = len(merged_trademarks)
-                                total_official = num_items * 270
-                                total_agent = num_items * agent_fee
-                                total_subtotal = total_official + total_agent
+                                total_official = sum(r["官费"] for r in processed_records)
+                                total_agent = sum(r["代理费"] for r in processed_records)
+                                total_fee = total_official + total_agent
                                 
-                                all_applicants_summary.append({
+                                # 保存汇总数据到数据库
+                                save_to_database(
+                                    st.session_state.db_path, 
+                                    "summary",
+                                    {
+                                        "case_type": st.session_state.case_type,
+                                        "applicant": applicant,
+                                        "unified_credit_code": unified_credit_code,
+                                        "total_official_fee": total_official,
+                                        "total_agent_fee": total_agent,
+                                        "total_fee": total_fee
+                                    }
+                                )
+                                
+                                excel_rows.append({
                                     "申请人": applicant,
-                                    "统一社会信用代码": unified_credit_code,
-                                    "日期": latest_date,
+                                    "统一社会信用代码": unified_credit_code,  # 添加统一社会信用代码
                                     "总官费": total_official,
                                     "总代理费": total_agent,
-                                    "总计": total_subtotal
+                                    "总计": total_fee,
                                 })
                     
                     except Exception as e:
@@ -461,8 +781,8 @@ def main_app():
                         st.text(traceback.format_exc())
                 
                 # 生成Excel汇总
-                if all_applicants_summary:
-                    excel_filename = create_excel_summary(all_applicants_summary, output_dir)
+                if excel_rows:
+                    excel_filename = build_excel(excel_rows, output_dir)
                     if excel_filename:
                         excel_path = os.path.join(output_dir, excel_filename)
                         with open(excel_path, "rb") as f:
@@ -484,7 +804,7 @@ def main_app():
 
     # 下载区域
     if st.session_state.processing_stage == 2 and st.session_state.generated_files:
-        st.header("4. 下载生成的文件")
+        st.header("5. 下载生成的文件")
         
         # 显示所有生成的文件
         st.subheader("生成的文件列表")
@@ -511,13 +831,31 @@ def main_app():
                     file_name=file["name"],
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
                 )
+        
+        # 数据库导出按钮
+        st.subheader("数据库导出")
+        if st.button("导出数据库为Excel"):
+            try:
+                db_excel_path = export_database_to_excel(st.session_state.db_path, output_dir)
+                with open(db_excel_path, "rb") as f:
+                    db_excel_data = f.read()
+                
+                st.download_button(
+                    label="下载商标案件数据库",
+                    data=db_excel_data,
+                    file_name="商标案件数据库.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                )
+                st.success("数据库导出成功！")
+            except Exception as e:
+                st.error(f"导出数据库时出错: {str(e)}")
 
     # 重置按钮
     if st.button("重置所有数据"):
         # 清除所有session状态
         keys_to_clear = list(st.session_state.keys())
         for key in keys_to_clear:
-            if key != 'temp_dir':  # 保留temp_dir以便清理
+            if key != 'temp_dir' and key != 'case_type':  # 保留temp_dir和case_type
                 del st.session_state[key]
         
         # 清理临时目录
@@ -530,30 +868,33 @@ def main_app():
         # 重新初始化必要的状态
         st.session_state.processing_stage = 0
         st.session_state.extracted_data = None
-        st.session_state.manual_input_needed = {}
         st.session_state.agent_fees = {}
         st.session_state.generated_files = []
         st.session_state.temp_dir = ""
+        st.session_state.db_path = ""
         
         st.success("系统已重置，可以开始新的处理流程！")
 
+# ============================= 应用入口 =============================
 # 显示模板状态
 st.sidebar.header("系统状态")
-if os.path.exists(PAYMENT_TEMPLATE) and os.path.exists(INVOICE_TEMPLATE):
+payment_template_exists = os.path.exists("请款单模板.docx")
+invoice_template_exists = os.path.exists("发票申请表.xlsx")
+
+if payment_template_exists and invoice_template_exists:
     st.sidebar.success("✅ 模板文件已就绪")
-    st.sidebar.info(f"请款单模板: {PAYMENT_TEMPLATE}")
-    st.sidebar.info(f"发票申请表模板: {INVOICE_TEMPLATE}")
+    st.sidebar.info("请款单模板: 请款单模板.docx")
+    st.sidebar.info("发票申请表模板: 发票申请表.xlsx")
     main_app()
 else:
     st.sidebar.error("⚠️ 模板文件缺失")
-    if not os.path.exists(PAYMENT_TEMPLATE):
-        st.sidebar.error(f"请款单模板 '{PAYMENT_TEMPLATE}' 不存在")
-    if not os.path.exists(INVOICE_TEMPLATE):
-        st.sidebar.error(f"发票申请表模板 '{INVOICE_TEMPLATE}' 不存在")
+    if not payment_template_exists:
+        st.sidebar.error("请款单模板 '请款单模板.docx' 不存在")
+    if not invoice_template_exists:
+        st.sidebar.error("发票申请表模板 '发票申请表.xlsx' 不存在")
     
     st.error("系统无法启动，因为缺少必要的模板文件。请确保以下文件与应用程序在同一目录下:")
-    st.error(f"- {PAYMENT_TEMPLATE}")
-    st.error(f"- {INVOICE_TEMPLATE}")
+    st.error("- 请款单模板.docx")
+    st.error("- 发票申请表.xlsx")
     
     st.info("请上传模板文件后重新启动应用程序")
-
