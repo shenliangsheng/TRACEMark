@@ -4,4 +4,3 @@ python-docx
 openpyxl
 PyMuPDF
 pandas
-sqlite3
