@@ -909,6 +909,7 @@ def history_page():
                                 data=file_data,
                                 file_name=file_row['file_name'],
                                 mime="application/octet-stream"
+                                key=f"download_{file_row['id']}"
                             )
                         else:
                             st.warning(f"文件不存在: {file_row['file_name']}")
@@ -930,7 +931,7 @@ if payment_template_exists and invoice_template_exists:
     st.sidebar.info("发票申请表模板: 发票申请表.xlsx")
     
     if app_mode == "案件处理":
-        main_app()
+        ()
     elif app_mode == "历史数据查询":
         history_page()
 else:
@@ -945,3 +946,4 @@ else:
     st.error("- 发票申请表.xlsx")
     
     st.info("请上传模板文件后重新启动应用程序")
+
