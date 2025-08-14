@@ -12,11 +12,51 @@ import shutil
 from pathlib import Path
 import sqlite3
 import pandas as pd
+import io
 
 # 设置页面标题和布局
 st.set_page_config(page_title="商标案件请款系统", layout="wide")
 st.title("商标案件请款系统")
 st.caption("案件类目前仅支持驳回复审、异议申请、无效申请和撤三申请")
+
+# 初始化数据库
+def init_database():
+    conn = sqlite3.connect('trademark_data.db')
+    c = conn.cursor()
+    
+    # 创建案件记录表
+    c.execute('''CREATE TABLE IF NOT EXISTS cases (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                applicant TEXT NOT NULL,
+                unified_credit_code TEXT,
+                case_type TEXT NOT NULL,
+                trademark_name TEXT NOT NULL,
+                category TEXT,
+                official_fee REAL,
+                agent_fee REAL,
+                total_fee REAL,
+                processing_date DATE NOT NULL,
+                original_filename TEXT NOT NULL,
+                generated_doc_path TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )''')
+    
+    # 创建文件记录表
+    c.execute('''CREATE TABLE IF NOT EXISTS generated_files (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                case_id INTEGER,
+                file_name TEXT NOT NULL,
+                file_type TEXT NOT NULL,
+                file_path TEXT NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (case_id) REFERENCES cases (id)
+                )''')
+    
+    conn.commit()
+    conn.close()
+
+# 初始化数据库
+init_database()
 
 # 初始化session状态
 if 'processing_stage' not in st.session_state:
@@ -31,8 +71,8 @@ if 'generated_files' not in st.session_state:
     st.session_state.generated_files = []
 if 'temp_dir' not in st.session_state:
     st.session_state.temp_dir = ""
-if 'db_path' not in st.session_state:
-    st.session_state.db_path = ""
+if 'show_history' not in st.session_state:
+    st.session_state.show_history = False
 
 # 官费标准
 OFFICIAL_FEES = {
@@ -258,85 +298,6 @@ def extract_invalid_case(text, filename):
         "商标列表": trademarks
     }
 
-# ============================= 数据库操作函数 =============================
-def init_database(db_path):
-    """初始化数据库"""
-    conn = sqlite3.connect(db_path)
-    c = conn.cursor()
-    
-    # 创建案件记录表
-    c.execute('''CREATE TABLE IF NOT EXISTS trademark_records (
-                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                 case_type TEXT,
-                 applicant TEXT,
-                 unified_credit_code TEXT,
-                 trademark_name TEXT,
-                 category TEXT,
-                 case_detail_type TEXT,
-                 official_fee REAL,
-                 agent_fee REAL,
-                 process_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-             )''')
-    
-    # 创建汇总记录表
-    c.execute('''CREATE TABLE IF NOT EXISTS summary_records (
-                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                 case_type TEXT,
-                 applicant TEXT,
-                 unified_credit_code TEXT,
-                 total_official_fee REAL,
-                 total_agent_fee REAL,
-                 total_fee REAL,
-                 process_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-             )''')
-    
-    conn.commit()
-    conn.close()
-
-def save_to_database(db_path, record_type, record):
-    """保存记录到数据库"""
-    conn = sqlite3.connect(db_path)
-    c = conn.cursor()
-    
-    if record_type == "trademark":
-        # 插入商标记录
-        c.execute('''INSERT INTO trademark_records 
-                     (case_type, applicant, unified_credit_code, trademark_name, category, case_detail_type, official_fee, agent_fee)
-                     VALUES (?, ?, ?, ?, ?, ?, ?, ?)''',
-                  (record['case_type'], record['applicant'], record['unified_credit_code'], 
-                   record['trademark_name'], record['category'], record['case_detail_type'],
-                   record['official_fee'], record['agent_fee']))
-    
-    elif record_type == "summary":
-        # 插入汇总记录
-        c.execute('''INSERT INTO summary_records 
-                     (case_type, applicant, unified_credit_code, total_official_fee, total_agent_fee, total_fee)
-                     VALUES (?, ?, ?, ?, ?, ?)''',
-                  (record['case_type'], record['applicant'], record['unified_credit_code'], 
-                   record['total_official_fee'], record['total_agent_fee'], record['total_fee']))
-    
-    conn.commit()
-    conn.close()
-
-def export_database_to_excel(db_path, output_dir):
-    """导出数据库为Excel文件"""
-    conn = sqlite3.connect(db_path)
-    
-    # 读取商标记录表
-    trademark_df = pd.read_sql_query("SELECT * FROM trademark_records", conn)
-    # 读取汇总记录表
-    summary_df = pd.read_sql_query("SELECT * FROM summary_records", conn)
-    
-    conn.close()
-    
-    # 创建Excel文件
-    excel_path = os.path.join(output_dir, "商标案件数据库.xlsx")
-    with pd.ExcelWriter(excel_path) as writer:
-        trademark_df.to_excel(writer, sheet_name='商标记录', index=False)
-        summary_df.to_excel(writer, sheet_name='汇总记录', index=False)
-    
-    return excel_path
-
 # ============================= 通用文档生成函数 =============================
 def create_word_doc(applicant, records, output_dir, case_type):
     """生成Word请款单"""
@@ -406,11 +367,11 @@ def create_word_doc(applicant, records, output_dir, case_type):
         output_path = os.path.join(output_dir, filename)
         doc.save(output_path)
         
-        return filename
+        return filename, output_path
     except Exception as e:
         st.error(f"生成Word文档时出错: {str(e)}")
         st.text(traceback.format_exc())
-        return None
+        return None, None
 
 def build_excel(rows, output_dir):
     """生成Excel汇总表"""
@@ -419,7 +380,7 @@ def build_excel(rows, output_dir):
     
     if not os.path.exists(template_path):
         st.error(f"错误: 找不到发票申请表模板文件 '{template_path}'")
-        return None
+        return None, None
     
     try:
         wb = load_workbook(template_path)
@@ -447,11 +408,80 @@ def build_excel(rows, output_dir):
         excel_path = os.path.join(output_dir, excel_name)
         wb.save(excel_path)
         
-        return excel_name
+        return excel_name, excel_path
     except Exception as e:
         st.error(f"生成Excel汇总时出错: {str(e)}")
         st.text(traceback.format_exc())
-        return None
+        return None, None
+
+# ============================= 数据库操作函数 =============================
+def save_case_to_db(applicant, unified_credit_code, case_type, trademark_name, category, 
+                    official_fee, agent_fee, total_fee, processing_date, original_filename, 
+                    generated_doc_path=None):
+    conn = sqlite3.connect('trademark_data.db')
+    c = conn.cursor()
+    
+    c.execute('''INSERT INTO cases (
+                 applicant, unified_credit_code, case_type, trademark_name, category, 
+                 official_fee, agent_fee, total_fee, processing_date, original_filename, generated_doc_path
+                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''', 
+              (applicant, unified_credit_code, case_type, trademark_name, category, 
+               official_fee, agent_fee, total_fee, processing_date, original_filename, generated_doc_path))
+    
+    case_id = c.lastrowid
+    conn.commit()
+    conn.close()
+    return case_id
+
+def save_file_to_db(case_id, file_name, file_type, file_path):
+    conn = sqlite3.connect('trademark_data.db')
+    c = conn.cursor()
+    
+    c.execute('''INSERT INTO generated_files (
+                 case_id, file_name, file_type, file_path
+                 ) VALUES (?, ?, ?, ?)''', 
+              (case_id, file_name, file_type, file_path))
+    
+    conn.commit()
+    conn.close()
+
+def get_all_cases():
+    conn = sqlite3.connect('trademark_data.db')
+    df = pd.read_sql_query("SELECT * FROM cases", conn)
+    conn.close()
+    return df
+
+def get_case_files(case_id):
+    conn = sqlite3.connect('trademark_data.db')
+    df = pd.read_sql_query(f"SELECT * FROM generated_files WHERE case_id = {case_id}", conn)
+    conn.close()
+    return df
+
+def get_filtered_cases(start_date, end_date, applicant, case_type):
+    conn = sqlite3.connect('trademark_data.db')
+    
+    query = "SELECT * FROM cases WHERE 1=1"
+    params = []
+    
+    if start_date:
+        query += " AND processing_date >= ?"
+        params.append(start_date.strftime("%Y-%m-%d"))
+    
+    if end_date:
+        query += " AND processing_date <= ?"
+        params.append(end_date.strftime("%Y-%m-%d"))
+    
+    if applicant:
+        query += " AND applicant LIKE ?"
+        params.append(f"%{applicant}%")
+    
+    if case_type:
+        query += " AND case_type = ?"
+        params.append(case_type)
+    
+    df = pd.read_sql_query(query, conn, params=params)
+    conn.close()
+    return df
 
 # ============================= 主应用逻辑 =============================
 def main_app():
@@ -475,11 +505,6 @@ def main_app():
                 # 创建临时目录
                 temp_dir = tempfile.mkdtemp()
                 st.session_state.temp_dir = temp_dir
-                
-                # 初始化数据库
-                db_path = os.path.join(temp_dir, "trademark_database.db")
-                st.session_state.db_path = db_path
-                init_database(db_path)
                 
                 pdf_dir = os.path.join(temp_dir, "pdf_files")
                 output_dir = os.path.join(temp_dir, "output")
@@ -519,6 +544,7 @@ def main_app():
                                         "案件类型": "商标注册申请",
                                         "官费": OFFICIAL_FEES["新申请商标"],
                                         "统一社会信用代码": unified_credit_code,  # 添加统一社会信用代码
+                                        "original_filename": filename,
                                     })
                                 
                                 extracted_data.append(data)
@@ -550,6 +576,7 @@ def main_app():
                                         "案件类型": data["案件类型"],
                                         "官费": OFFICIAL_FEES[data["案件类型"]],
                                         "统一社会信用代码": unified_credit_code,  # 添加统一社会信用代码
+                                        "original_filename": filename,
                                     })
                                 
                                 extracted_data.append(data)
@@ -661,23 +688,8 @@ def main_app():
                                                         "官费": OFFICIAL_FEES["新申请商标"],
                                                         "代理费": agent_fee,
                                                         "统一社会信用代码": unified_credit_code,
+                                                        "original_filename": tm.get("original_filename", "未知文件"),
                                                     })
-                                                    
-                                                    # 保存到数据库
-                                                    save_to_database(
-                                                        st.session_state.db_path, 
-                                                        "trademark",
-                                                        {
-                                                            "case_type": "新申请商标",
-                                                            "applicant": applicant,
-                                                            "unified_credit_code": unified_credit_code,
-                                                            "trademark_name": tm["商标名称"],
-                                                            "category": cat,
-                                                            "case_detail_type": "商标注册申请",
-                                                            "official_fee": OFFICIAL_FEES["新申请商标"],
-                                                            "agent_fee": agent_fee
-                                                        }
-                                                    )
                                         else:
                                             processed_records.append({
                                                 "商标名称": tm["商标名称"],
@@ -686,23 +698,8 @@ def main_app():
                                                 "官费": OFFICIAL_FEES["新申请商标"],
                                                 "代理费": agent_fee,
                                                 "统一社会信用代码": unified_credit_code,
+                                                "original_filename": tm.get("original_filename", "未知文件"),
                                             })
-                                            
-                                            # 保存到数据库
-                                            save_to_database(
-                                                st.session_state.db_path, 
-                                                "trademark",
-                                                {
-                                                    "case_type": "新申请商标",
-                                                    "applicant": applicant,
-                                                    "unified_credit_code": unified_credit_code,
-                                                    "trademark_name": tm["商标名称"],
-                                                    "category": tm["类别"],
-                                                    "case_detail_type": "商标注册申请",
-                                                    "official_fee": OFFICIAL_FEES["新申请商标"],
-                                                    "agent_fee": agent_fee
-                                                }
-                                            )
                         else:
                             # 案件类商标直接添加代理费
                             processed_records = []
@@ -712,26 +709,10 @@ def main_app():
                                 record["代理费"] = agent_fee
                                 record["统一社会信用代码"] = unified_credit_code
                                 processed_records.append(record)
-                                
-                                # 保存到数据库
-                                save_to_database(
-                                    st.session_state.db_path, 
-                                    "trademark",
-                                    {
-                                        "case_type": "案件类商标",
-                                        "applicant": applicant,
-                                        "unified_credit_code": unified_credit_code,
-                                        "trademark_name": record["商标名称"],
-                                        "category": record["类别"],
-                                        "case_detail_type": record["案件类型"],
-                                        "official_fee": record["官费"],
-                                        "agent_fee": agent_fee
-                                    }
-                                )
                         
                         # 生成Word文档
                         if processed_records:
-                            word_filename = create_word_doc(
+                            word_filename, word_path = create_word_doc(
                                 applicant, 
                                 processed_records, 
                                 output_dir,
@@ -739,42 +720,51 @@ def main_app():
                             )
                             
                             if word_filename:
-                                word_path = os.path.join(output_dir, word_filename)
+                                # 保存生成的文件到session
                                 with open(word_path, "rb") as f:
                                     word_data = f.read()
                                 
                                 generated_files.append({
                                     "name": word_filename,
                                     "data": word_data,
-                                    "type": "word"
+                                    "type": "word",
+                                    "path": word_path
                                 })
                                 
                                 # 收集汇总数据
                                 total_official = sum(r["官费"] for r in processed_records)
                                 total_agent = sum(r["代理费"] for r in processed_records)
-                                total_fee = total_official + total_agent
-                                
-                                # 保存汇总数据到数据库
-                                save_to_database(
-                                    st.session_state.db_path, 
-                                    "summary",
-                                    {
-                                        "case_type": st.session_state.case_type,
-                                        "applicant": applicant,
-                                        "unified_credit_code": unified_credit_code,
-                                        "total_official_fee": total_official,
-                                        "total_agent_fee": total_agent,
-                                        "total_fee": total_fee
-                                    }
-                                )
-                                
                                 excel_rows.append({
                                     "申请人": applicant,
                                     "统一社会信用代码": unified_credit_code,  # 添加统一社会信用代码
                                     "总官费": total_official,
                                     "总代理费": total_agent,
-                                    "总计": total_fee,
+                                    "总计": total_official + total_agent,
                                 })
+                                
+                                # 保存到数据库
+                                for record in processed_records:
+                                    case_id = save_case_to_db(
+                                        applicant=applicant,
+                                        unified_credit_code=unified_credit_code,
+                                        case_type=record["案件类型"],
+                                        trademark_name=record["商标名称"],
+                                        category=record["类别"],
+                                        official_fee=record["官费"],
+                                        agent_fee=record["代理费"],
+                                        total_fee=record["官费"] + record["代理费"],
+                                        processing_date=datetime.date.today().strftime("%Y-%m-%d"),
+                                        original_filename=record.get("original_filename", "未知文件"),
+                                        generated_doc_path=word_path
+                                    )
+                                    
+                                    # 保存文件记录
+                                    save_file_to_db(
+                                        case_id=case_id,
+                                        file_name=word_filename,
+                                        file_type="word",
+                                        file_path=word_path
+                                    )
                     
                     except Exception as e:
                         st.error(f"为申请人 '{applicant}' 生成请款单时出错: {str(e)}")
@@ -782,17 +772,26 @@ def main_app():
                 
                 # 生成Excel汇总
                 if excel_rows:
-                    excel_filename = build_excel(excel_rows, output_dir)
+                    excel_filename, excel_path = build_excel(excel_rows, output_dir)
                     if excel_filename:
-                        excel_path = os.path.join(output_dir, excel_filename)
+                        # 保存生成的文件到session
                         with open(excel_path, "rb") as f:
                             excel_data = f.read()
                         
                         generated_files.append({
                             "name": excel_filename,
                             "data": excel_data,
-                            "type": "excel"
+                            "type": "excel",
+                            "path": excel_path
                         })
+                        
+                        # 保存Excel文件记录
+                        save_file_to_db(
+                            case_id=None,  # 与特定case无关
+                            file_name=excel_filename,
+                            file_type="excel",
+                            file_path=excel_path
+                        )
                 
                 # 保存生成的文件到session
                 st.session_state.generated_files = generated_files
@@ -831,31 +830,13 @@ def main_app():
                     file_name=file["name"],
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
                 )
-        
-        # 数据库导出按钮
-        st.subheader("数据库导出")
-        if st.button("导出数据库为Excel"):
-            try:
-                db_excel_path = export_database_to_excel(st.session_state.db_path, output_dir)
-                with open(db_excel_path, "rb") as f:
-                    db_excel_data = f.read()
-                
-                st.download_button(
-                    label="下载商标案件数据库",
-                    data=db_excel_data,
-                    file_name="商标案件数据库.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-                )
-                st.success("数据库导出成功！")
-            except Exception as e:
-                st.error(f"导出数据库时出错: {str(e)}")
 
     # 重置按钮
     if st.button("重置所有数据"):
         # 清除所有session状态
         keys_to_clear = list(st.session_state.keys())
         for key in keys_to_clear:
-            if key != 'temp_dir' and key != 'case_type':  # 保留temp_dir和case_type
+            if key != 'temp_dir' and key != 'case_type' and key != 'show_history':  # 保留temp_dir和case_type
                 del st.session_state[key]
         
         # 清理临时目录
@@ -871,9 +852,68 @@ def main_app():
         st.session_state.agent_fees = {}
         st.session_state.generated_files = []
         st.session_state.temp_dir = ""
-        st.session_state.db_path = ""
         
         st.success("系统已重置，可以开始新的处理流程！")
+
+# ============================= 历史数据查询页面 =============================
+def history_page():
+    st.header("历史数据查询")
+    
+    # 查询条件
+    col1, col2 = st.columns(2)
+    with col1:
+        start_date = st.date_input("开始日期", value=datetime.date.today() - datetime.timedelta(days=30))
+    with col2:
+        end_date = st.date_input("结束日期", value=datetime.date.today())
+    
+    col3, col4 = st.columns(2)
+    with col3:
+        applicant = st.text_input("申请人")
+    with col4:
+        case_type = st.selectbox("案件类型", ["", "新申请商标", "驳回复审", "商标异议", "撤三申请", "无效宣告"])
+    
+    # 查询按钮
+    if st.button("查询数据"):
+        cases_df = get_filtered_cases(start_date, end_date, applicant, case_type)
+        
+        if not cases_df.empty:
+            st.success(f"查询到 {len(cases_df)} 条记录")
+            
+            # 显示数据
+            st.dataframe(cases_df)
+            
+            # 导出按钮
+            csv = cases_df.to_csv(index=False).encode('utf-8')
+            st.download_button(
+                label="导出为CSV",
+                data=csv,
+                file_name=f"商标案件数据_{datetime.datetime.now().strftime('%Y%m%d%H%M')}.csv",
+                mime='text/csv',
+            )
+            
+            # 显示文件下载
+            st.subheader("相关文件")
+            for _, row in cases_df.iterrows():
+                case_id = row['id']
+                files_df = get_case_files(case_id)
+                
+                if not files_df.empty:
+                    st.write(f"案件 {case_id} 的相关文件:")
+                    for _, file_row in files_df.iterrows():
+                        if os.path.exists(file_row['file_path']):
+                            with open(file_row['file_path'], "rb") as f:
+                                file_data = f.read()
+                            
+                            st.download_button(
+                                label=f"下载 {file_row['file_name']}",
+                                data=file_data,
+                                file_name=file_row['file_name'],
+                                mime="application/octet-stream"
+                            )
+                        else:
+                            st.warning(f"文件不存在: {file_row['file_name']}")
+        else:
+            st.warning("没有找到符合条件的记录")
 
 # ============================= 应用入口 =============================
 # 显示模板状态
@@ -881,11 +921,18 @@ st.sidebar.header("系统状态")
 payment_template_exists = os.path.exists("请款单模板.docx")
 invoice_template_exists = os.path.exists("发票申请表.xlsx")
 
+# 主菜单
+app_mode = st.sidebar.selectbox("选择功能", ["案件处理", "历史数据查询"])
+
 if payment_template_exists and invoice_template_exists:
     st.sidebar.success("✅ 模板文件已就绪")
     st.sidebar.info("请款单模板: 请款单模板.docx")
     st.sidebar.info("发票申请表模板: 发票申请表.xlsx")
-    main_app()
+    
+    if app_mode == "案件处理":
+        main_app()
+    elif app_mode == "历史数据查询":
+        history_page()
 else:
     st.sidebar.error("⚠️ 模板文件缺失")
     if not payment_template_exists:
