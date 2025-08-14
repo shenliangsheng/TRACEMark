@@ -908,7 +908,7 @@ def history_page():
                                 label=f"下载 {file_row['file_name']}",
                                 data=file_data,
                                 file_name=file_row['file_name'],
-                                mime="application/octet-stream"
+                                mime="application/octet-stream",
                                 key=f"download_{file_row['id']}"
                             )
                         else:
@@ -946,4 +946,5 @@ else:
     st.error("- 发票申请表.xlsx")
     
     st.info("请上传模板文件后重新启动应用程序")
+
 
